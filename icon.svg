@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" role="img" aria-label="Fullstack project pair">
+  <rect x="2" y="6" width="11" height="20" rx="2.5" fill="#4C6FFF"/>
+  <rect x="19" y="6" width="11" height="20" rx="2.5" fill="#18C29C"/>
+  <path d="M13 16h6" stroke="#8A93A8" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="13" cy="16" r="1.8" fill="#8A93A8"/>
+  <circle cx="19" cy="16" r="1.8" fill="#8A93A8"/>
+</svg>

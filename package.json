@@ -1,0 +1,48 @@
+{
+  "name": "@local/fullstack-pair",
+  "version": "1.2.2",
+  "private": true,
+  "type": "module",
+  "description": "多目录任务范围：让一个会话在多个任意目录间共享检索范围（DSH 插件，含 GUI 菜单与系统提示注入）。",
+  "engines": {
+    "dsh": "^0.2.2-rc.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR-GITHUB-NAME/fullstack-pair.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "multi-root",
+    "workspace",
+    "cross-repository"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "pair.config.json",
+    "README.md",
+    "PUBLISHING.md",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

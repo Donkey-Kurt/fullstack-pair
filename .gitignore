@@ -1,0 +1,14 @@
+# 依赖与构建产物不入库
+node_modules/
+dist/
+*.tgz
+*.log
+
+# 插件运行时状态（属于用户机器，不应提交）
+scopes.json
+client-ready.json
+fork-probe.json
+
+# 编辑器与系统文件
+.DS_Store
+Thumbs.db

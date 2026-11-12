@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Multi-root task scope",
+    "description": "Lets a session pull any number of directories into one task scope at runtime, with cross-root overview and search tools."
+  }
+}
