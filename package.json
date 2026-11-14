@@ -1,7 +1,6 @@
 {
-  "name": "@local/fullstack-pair",
+  "name": "dsh-fullstack-pair",
   "version": "1.2.2",
-  "private": true,
   "type": "module",
   "description": "多目录任务范围：让一个会话在多个任意目录间共享检索范围（DSH 插件，含 GUI 菜单与系统提示注入）。",
   "engines": {
