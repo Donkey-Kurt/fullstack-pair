@@ -47,7 +47,18 @@
  * @module @local/fullstack-pair
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -73,6 +84,35 @@ const SCOPES_FILE = path.join(STATE_DIR, 'scopes.json');
 /** 旧版状态文件位置（包目录内），仅用于升级时一次性迁移读取。 */
 const LEGACY_SCOPES_FILE = path.join(PACKAGE_DIR, 'scopes.json');
 
+/**
+ * 变更日志（append-only）：每次范围变更追加一行"该会话的完整快照"。
+ *
+ * 为什么需要它：`scopes.json` 是整体重写，任何一次写盘失败（Windows 上 rename 被占用、
+ * 磁盘/杀软短暂拦截等）都会让内存与磁盘静默分叉；进程一重启就回落到旧快照，
+ * 用户看到的就是"范围凭空丢失"。追加日志比整体重写脆弱面小得多（只追加，不 rename），
+ * 加载时按 `at` 逐行重放即可把丢失的写盘补回来。
+ */
+const JOURNAL_FILE = path.join(STATE_DIR, 'scopes.journal.jsonl');
+
+/**
+ * 上一次成功写盘的快照副本。
+ *
+ * 快照本身被外部改坏（手工编辑、被旧实例覆盖）时，用它能回到上一份可用状态；
+ * 加载时只在主快照缺失或损坏时使用，不参与正常合并，避免把被撤回的旧范围又带回来。
+ */
+const BACKUP_FILE = path.join(STATE_DIR, 'scopes.bak.json');
+
+/** 变更日志的重放上限：只保留最近这么多行，超过后压实重写。 */
+const JOURNAL_LIMIT = 500;
+
+/**
+ * DSH 的工作区注册表。
+ *
+ * 只在主根解析兜底时读取：某些会话（归档、插件加载前就存在、刚从侧栏点开）取不到
+ * agent 也取不到 live session header，但注册表里仍然记着"这个会话属于哪个工作区路径"。
+ */
+const WORKSPACE_REGISTRY_FILE = path.join(path.dirname(STATE_DIR), 'workspace.json');
+
 /** 持久化格式版本；结构变化时递增，读取端只接受同版本。 */
 const SCOPES_VERSION = 1;
 
@@ -86,7 +126,18 @@ const SCOPES_TTL_MS = 90 * 24 * 60 * 60 * 1000;
  * 之所以单独维护镜像而不是只写"当前内存里的会话"：内存只包含已加载过的会话，而磁盘里
  * 还有其它会话的记录，整体写回时必须把它们一起带上，否则会被覆盖丢失。
  */
-const persisted = { loaded: false, sessions: new Map(), recent: [], forks: new Map() };
+const persisted = {
+  loaded: false,
+  sessions: new Map(),
+  recent: [],
+  forks: new Map(),
+  /** 最近一次成功写盘的时间（epoch ms）；0 表示本进程还没写成功过。 */
+  lastWriteAt: 0,
+  /** 最近一次写盘失败的描述；空串表示当前没有已知故障。 */
+  lastWriteError: '',
+  /** 加载阶段是否发现"磁盘比变更日志旧"并做了一次补偿，用于给用户一次性提示。 */
+  recoveredFromJournal: 0,
+};
 
 /**
  * fork 父子映射的保留条数。
@@ -124,26 +175,32 @@ function loadPersisted() {
 
   // 升级路径：新状态目录没有文件、而旧版（包目录）有时，读旧文件做一次性迁移；
   // 下一次写盘会落到新位置。
-  const source = existsSync(SCOPES_FILE)
-    ? SCOPES_FILE
-    : (existsSync(LEGACY_SCOPES_FILE) ? LEGACY_SCOPES_FILE : SCOPES_FILE);
+  /**
+   * 快照来源，按可靠性排序：主快照 → 上一次备份 → 旧版包目录文件。
+   *
+   * 之所以要备份这一层：主快照可能被"内存已分叉的旧实例"覆盖成更旧的内容，
+   * 备份至少让读取方多一个可用版本，而不是只剩一份坏数据。
+   */
+  const candidates = [SCOPES_FILE, BACKUP_FILE, LEGACY_SCOPES_FILE];
+  const source = candidates.find((file) => existsSync(file)) ?? SCOPES_FILE;
 
-  let raw;
+  let raw = null;
   try {
     raw = JSON.parse(readFileSync(source, 'utf8'));
   }
   catch (error) {
     if (existsSync(source)) reportWarning(`读取 ${source} 失败：${messageOf(error)}`);
-    return;
   }
 
-  if (raw?.version !== SCOPES_VERSION || raw?.sessions === null || typeof raw?.sessions !== 'object') {
+  // 快照损坏不再直接返回：变更日志里可能还留着比它更新的范围，继续往下重放。
+  if (raw !== null && (raw?.version !== SCOPES_VERSION || raw?.sessions === null || typeof raw?.sessions !== 'object')) {
     reportWarning(`${source} 版本或结构不符（期望 version=${SCOPES_VERSION}），已忽略`);
-    return;
+    raw = null;
   }
 
   const now = Date.now();
-  for (const [sessionKey, value] of Object.entries(raw.sessions)) {
+  const snapshotSessions = raw?.sessions !== null && typeof raw?.sessions === 'object' ? raw.sessions : {};
+  for (const [sessionKey, value] of Object.entries(snapshotSessions)) {
     if (!Array.isArray(value?.entries)) continue;
     const updatedAt = typeof value.updatedAt === 'string' ? Date.parse(value.updatedAt) : Number.NaN;
     if (Number.isFinite(updatedAt) && now - updatedAt > SCOPES_TTL_MS) continue;
@@ -157,8 +214,10 @@ function loadPersisted() {
     }
   }
 
+  replayJournal(now);
+
   // 最近使用是可选字段：旧文件没有它，或格式不对时按空列表处理，不影响会话范围恢复。
-  if (Array.isArray(raw.recent)) {
+  if (Array.isArray(raw?.recent)) {
     for (const item of raw.recent) {
       if (typeof item?.path !== 'string' || item.path.trim() === '') continue;
       persisted.recent.push({
@@ -192,7 +251,7 @@ function loadPersisted() {
   }
 
   // fork 父子映射：精确来源，跨重启保留（fork 与"打开子会话"之间可能隔着一次重启）。
-  if (raw.forks !== null && typeof raw.forks === 'object') {
+  if (raw?.forks !== null && typeof raw?.forks === 'object') {
     for (const [childId, parentId] of Object.entries(raw.forks)) {
       if (typeof childId !== 'string' || childId === '') continue;
       if (typeof parentId !== 'string' || parentId === '') continue;
@@ -200,6 +259,63 @@ function loadPersisted() {
       if (persisted.forks.size >= FORK_LIMIT) break;
     }
   }
+}
+
+/**
+ * 重放变更日志，把"写进日志但没进快照"的范围补回内存镜像。
+ *
+ * 逐行语义：每行是该会话在当时那一刻的**完整快照**（不是增量），因此同一会话
+ * 后出现的行直接覆盖先出现的行——不需要担心"增删顺序"这种易错逻辑。
+ * 只有 `at` 比镜像里记录更新的行才生效，避免把用户后来撤回的旧范围又拎回来。
+ *
+ * @param now - 当前时间，用于丢弃超过 TTL 的陈旧日志行。
+ * @returns 无（结果写入 `persisted`）。
+ */
+function replayJournal(now) {
+  let text;
+  try {
+    text = readFileSync(JOURNAL_FILE, 'utf8');
+  }
+  catch {
+    return;
+  }
+
+  let applied = 0;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    let record;
+    try {
+      record = JSON.parse(trimmed);
+    }
+    catch {
+      // 半行（进程在追加时被杀）只影响这一行，跳过继续重放其余行。
+      continue;
+    }
+    if (typeof record?.session !== 'string' || record.session === '') continue;
+    if (!Array.isArray(record.entries)) continue;
+    const at = typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Number.NaN;
+    if (!Number.isFinite(at)) continue;
+    if (now - at > SCOPES_TTL_MS) continue;
+
+    const known = persisted.sessions.get(record.session);
+    if (known !== undefined && known.updatedAt >= at) continue;
+
+    const entries = new Map();
+    for (const entry of record.entries) {
+      if (typeof entry?.path !== 'string' || entry.path.trim() === '') continue;
+      entries.set(path.resolve(entry.path), typeof entry.label === 'string' ? entry.label : '');
+    }
+    if (entries.size === 0) {
+      // 空快照是合法的"该会话已无额外目录"：用它覆盖旧记录，而不是当作无效行丢弃。
+      persisted.sessions.delete(record.session);
+      if (known !== undefined) applied += 1;
+      continue;
+    }
+    persisted.sessions.set(record.session, { updatedAt: at, entries });
+    if (known === undefined || known.updatedAt < at) applied += 1;
+  }
+  persisted.recoveredFromJournal = applied;
 }
 
 /**
@@ -224,10 +340,33 @@ function writeStore() {
   const forks = {};
   for (const [childId, parentId] of persisted.forks) forks[childId] = parentId;
 
+  const payload = JSON.stringify({ version: SCOPES_VERSION, sessions, recent, forks }, null, 2);
+
   try {
+    // 先轮转备份：把"写之前那份可用快照"留下来，主快照随后被覆盖也不至于无从回退。
+    try {
+      if (existsSync(SCOPES_FILE)) copyFileSync(SCOPES_FILE, BACKUP_FILE);
+    }
+    catch {
+      // 备份失败不阻断主写入：备份是额外保险，不是正确性前提。
+    }
+
     const temporary = `${SCOPES_FILE}.tmp`;
-    writeFileSync(temporary, JSON.stringify({ version: SCOPES_VERSION, sessions, recent, forks }, null, 2), 'utf8');
+    writeFileSync(temporary, payload, 'utf8');
     renameSync(temporary, SCOPES_FILE);
+
+    // 读回校验：Windows 上 rename 成功但落盘内容异常（磁盘/杀软介入）时，
+    // 只靠返回值发现不了。校验失败当作写盘失败处理，避免内存与磁盘静默分叉。
+    const written = readFileSync(SCOPES_FILE, 'utf8');
+    if (written !== payload) throw new Error('写入内容与内存不一致（读回校验失败）');
+
+    persisted.lastWriteAt = Date.now();
+    if (persisted.lastWriteError !== '') {
+      persisted.lastWriteError = '';
+      reportWarning(`范围存储已恢复正常写入：${SCOPES_FILE}`);
+    }
+    compactJournal();
+
     // 迁移完成：旧位置（包目录）的文件不再被读取，删掉避免两份状态并存造成误导。
     try {
       if (existsSync(LEGACY_SCOPES_FILE)) unlinkSync(LEGACY_SCOPES_FILE);
@@ -237,12 +376,60 @@ function writeStore() {
     }
   }
   catch (error) {
-    reportWarning(`写入 ${SCOPES_FILE} 失败：${messageOf(error)}`);
+    persisted.lastWriteError = messageOf(error);
+    reportWarning(`写入 ${SCOPES_FILE} 失败：${persisted.lastWriteError}`);
+  }
+}
+
+/**
+ * 把一次范围变更追加进变更日志。
+ *
+ * 放在快照写入**之前**：即使随后的快照写入失败，这行日志也已经落盘，
+ * 下次启动重放时可以把这次变更补回来。写入失败只告警，不阻断主流程
+ * （日志本身写不进去时，行为退化为旧版：只靠快照）。
+ *
+ * @param sessionKey - 会话标识。
+ * @param updatedAt - 本次变更时间（epoch ms），重放时用它做"谁更新"的比较。
+ * @param scope - 该会话的完整范围集合。
+ * @returns 无。
+ */
+function appendJournal(sessionKey, updatedAt, scope) {
+  const entries = [...scope].map(([dir, label]) => ({ path: dir, label }));
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    appendFileSync(JOURNAL_FILE, `${JSON.stringify({ at: updatedAt, session: sessionKey, entries })}\n`, 'utf8');
+  }
+  catch (error) {
+    reportWarning(`追加范围变更日志失败：${messageOf(error)}`);
+  }
+}
+
+/**
+ * 压缩变更日志：只保留最近 JOURNAL_LIMIT 行，避免无限增长。
+ *
+ * 只在快照写入成功之后调用——此时快照已经包含了日志里的全部状态，
+ * 压缩不会丢失任何可恢复信息。
+ *
+ * @returns 无。
+ */
+function compactJournal() {
+  try {
+    if (!existsSync(JOURNAL_FILE)) return;
+    const lines = readFileSync(JOURNAL_FILE, 'utf8').split('\n').filter((line) => line.trim() !== '');
+    if (lines.length <= JOURNAL_LIMIT) return;
+    writeFileSync(`${JOURNAL_FILE}.tmp`, `${lines.slice(-JOURNAL_LIMIT).join('\n')}\n`, 'utf8');
+    renameSync(`${JOURNAL_FILE}.tmp`, JOURNAL_FILE);
+  }
+  catch {
+    // 压缩失败不影响正确性：重放侧按 updatedAt 去重，旧行最多让启动慢一点点。
   }
 }
 
 /**
  * 记下一个会话的当前范围并落盘。
+ *
+ * 顺序即数据安全策略：**先追加日志，再整体重写快照**。日志是"这次变更确实发生过"的
+ * 第一手证据，快照是可以重放重建的派生数据。
  *
  * @param sessionKey - 会话标识。
  * @param scope - 该会话的范围集合（权威内存态）。
@@ -250,7 +437,9 @@ function writeStore() {
  */
 function persistSession(sessionKey, scope) {
   loadPersisted();
-  persisted.sessions.set(sessionKey, { updatedAt: Date.now(), entries: new Map(scope) });
+  const updatedAt = Date.now();
+  persisted.sessions.set(sessionKey, { updatedAt, entries: new Map(scope) });
+  appendJournal(sessionKey, updatedAt, scope);
   writeStore();
 }
 
@@ -465,6 +654,14 @@ const SCOPES = new Map();
 const AGENTS = new Map();
 
 /**
+ * 工作区注册表的解析缓存：`{ at: mtimeMs, index: Map<sessionId|workspaceId, workspacePath> }`。
+ *
+ * 主根兜底会读 `storages/workspace.json`，而菜单每次展开都要解析主根；
+ * 用文件 mtime 判断是否需要重新解析，既避免重复 IO，又能在 DSH 改动注册表后立刻跟上。
+ */
+let workspaceCache = { at: -1, index: new Map() };
+
+/**
  * fork 的精确来源（`forks`）：子会话 id → 父会话 id，随 `scopes.json` 落盘。
  *
  * DSH 里 `SessionStore.fork()` 不把父会话写进 header（`parentSession` 只用于子代理），
@@ -617,7 +814,7 @@ async function handleScopeRequest(request, resolvePrimary) {
     // 自愈：旧版本可能把主根登记成了额外目录，读取时顺手清掉并落盘。
     if (dropPrimaryDuplicate(scope, primary)) persistSession(sessionKey, scope);
     const view = scopeEntries(sessionKey, scope, primary);
-    return jsonResponse({ ok: true, primary, recent: recentDirs(), branches: branchView(primary, view.entries), ...view });
+    return jsonResponse({ ok: true, primary, recent: recentDirs(), branches: branchView(primary, view.entries), ...view, ...writeHealth() });
   }
 
   let payload;
@@ -668,7 +865,23 @@ async function handleScopeRequest(request, resolvePrimary) {
   persistSession(sessionKey, scope);
 
   const view = scopeEntries(sessionKey, scope, primary);
-  return jsonResponse({ ok: true, primary, recent: recentDirs(), branches: branchView(primary, view.entries), ...view });
+  return jsonResponse({ ok: true, primary, recent: recentDirs(), branches: branchView(primary, view.entries), ...view, ...writeHealth() });
+}
+
+/**
+ * 汇总"持久化健康度"，随每次范围查询返回给 GUI。
+ *
+ * 为什么必须外露：写盘失败在本插件里是**数据丢失的前兆**（内存继续工作，重启即回退）。
+ * 旧版本只把失败打到控制台，用户完全看不到，直到某次重启才发现范围没了。
+ * 现在把它变成菜单里的一行可见告警，问题一出现就能被发现。
+ *
+ * @returns `{ warning }`：`warning` 为空串表示健康。
+ */
+function writeHealth() {
+  if (persisted.lastWriteError !== '') {
+    return { warning: `范围写盘失败：${persisted.lastWriteError}` };
+  }
+  return { warning: '' };
 }
 /**
  * 读取可选配置。
@@ -1190,7 +1403,49 @@ export function apply(ctx) {
     catch {
       // 读取 header 失败同样只降级为"没有主根"，不影响其它逻辑。
     }
+
+    // 第三条来源：DSH 的工作区注册表。归档会话、侧栏里没打开过的会话、
+    // 以及插件激活前就存在的会话往往前两条都取不到，但注册表里仍记着归属工作区。
+    const fromRegistry = workspaceCwdOf(sessionKey);
+    if (fromRegistry !== '') {
+      return { label: path.basename(fromRegistry) || fromRegistry, path: fromRegistry };
+    }
     return null;
+  }
+
+  /**
+   * 从 DSH 的工作区注册表里查某个会话的会话目录。
+   *
+   * 只读 `storages/workspace.json`，用 mtime 做缓存，避免菜单反复打开时反复解析。
+   * 读取或结构异常一律返回空串（调用方降级为"没有主根"），绝不让菜单报错。
+   *
+   * @param sessionKey - 会话标识。
+   * @returns 工作区绝对路径；查不到返回空串。
+   */
+  function workspaceCwdOf(sessionKey) {
+    try {
+      const stat = statSync(WORKSPACE_REGISTRY_FILE);
+      if (workspaceCache.at !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(WORKSPACE_REGISTRY_FILE, 'utf8'));
+        const table = raw?.tables?.workspaces;
+        const index = new Map();
+        if (table !== null && typeof table === 'object') {
+          for (const [workspaceId, value] of Object.entries(table)) {
+            const workspacePath = typeof value?.path === 'string' ? value.path : '';
+            if (workspacePath === '' || !Array.isArray(value?.sessionIds)) continue;
+            for (const id of value.sessionIds) {
+              if (typeof id === 'string' && id !== '') index.set(id, workspacePath);
+            }
+            if (!index.has(workspaceId)) index.set(workspaceId, workspacePath);
+          }
+        }
+        workspaceCache = { at: stat.mtimeMs, index };
+      }
+      return workspaceCache.index.get(sessionKey) ?? '';
+    }
+    catch {
+      return '';
+    }
   }
 
   /**

@@ -97,9 +97,11 @@ pnpm pack --pack-destination dist
 状态（`scopes.json`，含范围 / 最近使用 / fork 映射）落在**独立状态目录**，不在包目录内：
 
 ```
-$DSH_HOME/storages/fullstack-pair/scopes.json      # 默认 %USERPROFILE%\.dsh\storages\fullstack-pair
-$DSH_HOME/storages/fullstack-pair/client-ready.json   # Client 半部加载自检
-$DSH_HOME/storages/fullstack-pair/fork-probe.json     # fork 继承判定证据
+$DSH_HOME/storages/fullstack-pair/scopes.json            # 主快照（默认 %USERPROFILE%\.dsh\storages\fullstack-pair）
+$DSH_HOME/storages/fullstack-pair/scopes.journal.jsonl    # 变更日志（append-only，恢复用）
+$DSH_HOME/storages/fullstack-pair/scopes.bak.json         # 上一次成功写盘的快照副本
+$DSH_HOME/storages/fullstack-pair/client-ready.json       # Client 半部加载自检
+$DSH_HOME/storages/fullstack-pair/fork-probe.json         # fork 继承判定证据
 ```
 
 ```json
@@ -110,13 +112,31 @@ $DSH_HOME/storages/fullstack-pair/fork-probe.json     # fork 继承判定证据
 
 - **为什么外置**：打包安装后包体在 `node_modules` 里，重装/升级会整体替换该目录；状态放
   独立目录才不会丢。旧版本写在包目录里的 `scopes.json` 会在首次读取时自动迁移。
-- **写入时机**：任何一次范围变更（工具调用、GUI 菜单点击）都会立即整体重写，用
-  "临时文件 + rename"保证原子性，避免进程退出时留下半个文件。
-- **恢复时机**：会话首次访问范围时（提示组装 / 工具调用 / GUI 读取）自动读回，所以
-  DSH 重启后范围仍在。
-- **容错**：文件缺失是正常状态；结构或版本不符、条目字段错误的记录一律跳过，并在
-  插件日志里留一条 warning，不会因为坏文件导致插件激活失败。
-- **清理**：范围记录带 90 天 TTL，加载时丢弃更早的会话；最近使用保留 20 条、fork 映射 200 条。
+- **写入时机**：任何一次范围变更（工具调用、GUI 菜单点击）都会立即落盘。顺序是
+  **先追加变更日志，再整体重写快照**——日志是"这次变更确实发生过"的第一手证据，
+  快照是可以由日志重放重建的派生数据。
+- **写盘失败必须可见**：写完读回校验，内容不一致即视为失败；失败会
+  （1）保留 `lastWriteError`，（2）写 logger warning，（3）在 GUI 菜单与头部徽章上显示
+  `⚠` 告警。**不再有"内存继续工作、磁盘悄悄落后"的静默状态**。
+- **恢复时机**：DSH 启动时读回快照，并按 `at` 重放变更日志（每行是该会话的完整快照，
+  后出现的覆盖先出现的）。因此即使某次快照写入失败、或进程被强杀，重启后范围仍能补齐。
+- **容错**：主快照损坏时不会中断加载，会继续用日志重放恢复；只有主快照缺失时才回退到
+  `scopes.bak.json`。结构或版本不符、条目字段错误的记录一律跳过，并在插件日志里留 warning。
+- **清理**：范围记录带 90 天 TTL，加载时丢弃更早的会话；最近使用保留 20 条、fork 映射 200 条；
+  变更日志保留最近 500 行（快照写入成功后自动压实）。
+
+### 范围丢失后的恢复
+
+历史会话日志里存着每一轮注入给模型的「本会话范围」文本，是 `scopes.json` 之外唯一
+带时间戳的真值来源。仓库 `tools/recover-scopes.mjs` 用它做恢复：
+
+```powershell
+node tools/recover-scopes.mjs           # 只报告可恢复项，不写文件
+node tools/recover-scopes.mjs --apply   # 备份当前快照，并向变更日志追加恢复记录
+```
+
+恢复记录只在该快照确实比主快照更新时生效，并按日志里的原始时间戳写入，
+不会覆盖你之后真正做过的修改。写入后重启 DSH 即生效。
 
 ## 边界（重要）
 

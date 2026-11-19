@@ -162,11 +162,23 @@ window.__ModuleLoader__.load({
         function buildScopeChildren(sessionId, primary, entries, recent) {
           const children = [];
           if (primary !== null) {
+            // 不用 `disabled`：禁用项在某些渲染路径上会被整行跳过，导致"范围里明明有主根，
+            // 菜单却像空的"。改成可点但只给解释，保证这一行一定看得见。
             children.push({
               id: 'primary',
               label: `★ ${primary.label}（工作区）`,
-              disabled: true,
-              run: () => {},
+              run: () => {
+                ctx.contextMenus.notify?.(`主根恒在范围内，无需重复添加：${primary.path}`, true);
+              },
+            });
+          }
+          else {
+            children.push({
+              id: 'primary-unknown',
+              label: '· 会话工作区未定位（范围只含下方目录）',
+              run: () => {
+                ctx.contextMenus.notify?.('没能解析出这个会话的工作区路径；下方目录仍然有效，可用「添加其他目录…」补齐。', false);
+              },
             });
           }
           entries.forEach((entry, index) => {
@@ -255,10 +267,24 @@ window.__ModuleLoader__.load({
             const primary = state?.primary ?? null;
             const entries = Array.isArray(state?.entries) ? state.entries : [];
             const recent = Array.isArray(state?.recent) ? state.recent : [];
+            const warning = typeof state?.warning === 'string' ? state.warning : '';
+            const children = buildScopeChildren(sessionId, primary, entries, recent);
+            // 写盘告警放在最前：它是"这些范围在下次重启后会消失"的唯一提示，
+            // 不能只留在控制台里（旧版就是这么静默丢数据的）。
+            if (warning !== '') {
+              children.unshift({
+                id: 'storage-warning',
+                label: `⚠ ${warning}`,
+                // 同上：不用 disabled，保证这条告警一定渲染出来。
+                run: () => {
+                  ctx.contextMenus.notify?.('范围写盘失败，改动可能只存在内存里。请检查状态目录权限与磁盘空间，并重启 DSH 让其从变更日志恢复。', false);
+                },
+              });
+            }
             return [{
               id: 'scope',
-              label: `本次任务范围：${(primary !== null ? 1 : 0) + entries.length} 个目录`,
-              children: buildScopeChildren(sessionId, primary, entries, recent),
+              label: `本次任务范围：${(primary !== null ? 1 : 0) + entries.length} 个目录${warning === '' ? '' : ' ⚠'}`,
+              children,
             }];
           },
         }), 'fullstack-pair: session scope menu');
@@ -432,10 +458,13 @@ window.__ModuleLoader__.load({
             : (names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`);
 
           // 悬停显示明细：主根、各目录、以及每个目录真实分支（非 git 仓库显式标注）。
+          // 写盘告警必须出现在这里：它是"范围会在下次重启后丢失"的唯一先兆。
+          const warning = typeof state.warning === 'string' ? state.warning : '';
           const title = [
             primary !== null ? `★ ${primary.label}（工作区）` : '',
             ...entries.map((entry) => `✓ ${entry.label}`),
             ...branches.map((item) => `${item.path} → ${item.branch === '' ? '(非 git 仓库)' : item.branch}`),
+            warning === '' ? '' : `⚠ ${warning}`,
           ].filter((line) => line !== '').join('\n');
 
           return React.createElement('span', {
@@ -446,7 +475,7 @@ window.__ModuleLoader__.load({
               padding: '1px 8px',
               marginLeft: '6px',
               borderRadius: '999px',
-              border: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.35))',
+              border: `1px solid ${warning === '' ? 'var(--dsw-alias-border-l1, rgba(128,128,128,0.35))' : 'var(--dsw-alias-state-warning-border, #d97706)'}`,
               color: 'var(--dsw-alias-interactive-secondary, inherit)',
               fontSize: '12px',
               lineHeight: '18px',
@@ -454,7 +483,7 @@ window.__ModuleLoader__.load({
               cursor: 'default',
               verticalAlign: 'middle',
             },
-          }, `📁 ${count}${branchText === '' ? '' : ` · ${branchText}`}`);
+          }, `${warning === '' ? '' : '⚠ '}📁 ${count}${branchText === '' ? '' : ` · ${branchText}`}`);
         }
 
         // 槽位服务可用时才注册；无会话/首页不挂载头部，注册本身无害。
